@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Backtest — polymarket-edge{% endblock %}
+{% block content %}
+<h1>Backtest trades</h1>
+
+<h2>Bucket summary</h2>
+<table>
+  <tr>
+    <th>Bucket</th><th>n</th><th>Hit rate</th><th>Mean ROI</th><th>Total PnL</th>
+  </tr>
+  {% for row in summary %}
+    <tr>
+      <td>{{ row.bucket }}</td>
+      <td>{{ row.n }}</td>
+      <td>{{ "%.1f%%"|format(row.hit_rate * 100) }}</td>
+      <td class="{{ 'pos' if row.mean_roi >= 0 else 'neg' }}">{{ "%.2fx"|format(row.mean_roi) }}</td>
+      <td class="{{ 'pos' if row.total_pnl >= 0 else 'neg' }}">${{ "%.2f"|format(row.total_pnl) }}</td>
+    </tr>
+  {% endfor %}
+</table>
+
+<h2>Trades ({{ rows|length }} of {{ total }})</h2>
+<table>
+  <tr>
+    <th>Market</th><th>Resolution</th><th>Entry</th><th>Payout/share</th>
+    <th>Capital</th><th>PnL</th><th>ROI</th>
+  </tr>
+  {% for row in rows %}
+    <tr>
+      <td>{{ row.slug or row.market_id }}</td>
+      <td><span class="pill">{{ row.resolution }}</span></td>
+      <td>${{ "%.3f"|format(row.entry_price) }}</td>
+      <td>${{ "%.2f"|format(row.payout_per_share) }}</td>
+      <td>${{ "%.2f"|format(row.capital) }}</td>
+      <td class="{{ 'pos' if row.pnl >= 0 else 'neg' }}">${{ "%.2f"|format(row.pnl) }}</td>
+      <td class="{{ 'pos' if row.roi >= 0 else 'neg' }}">{{ "%.2fx"|format(row.roi) }}</td>
+    </tr>
+  {% endfor %}
+</table>
+{% endblock %}

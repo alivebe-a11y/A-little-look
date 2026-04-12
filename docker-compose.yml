@@ -1,0 +1,36 @@
+services:
+  web:
+    build: .
+    image: polymarket-edge:latest
+    container_name: polymarket-edge-web
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      POLYMARKET_EDGE_DATA: /app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz').read()"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+  # One-shot helper: `docker compose run --rm ingest`
+  ingest:
+    image: polymarket-edge:latest
+    profiles: ["jobs"]
+    depends_on:
+      - web
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      POLYMARKET_EDGE_DATA: /app/data
+    entrypoint: ["polymarket-edge"]
+    command: ["ingest", "--since", "2024-01-01"]

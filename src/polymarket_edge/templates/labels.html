@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Labels — polymarket-edge{% endblock %}
+{% block content %}
+<h1>Resolved markets</h1>
+
+<div class="filters">
+  Filter:
+  <a href="/labels">all</a>
+  {% for r in available_resolutions %}
+    <a href="/labels?resolution={{ r }}"
+       class="pill {{ 'active' if r == resolution else '' }}">{{ r }}</a>
+  {% endfor %}
+</div>
+
+<p>Showing {{ rows|length }} of {{ total }} rows{% if resolution %} filtered to <code>{{ resolution }}</code>{% endif %}.</p>
+
+<table>
+  <tr>
+    <th>ID</th><th>Question</th><th>Slug</th><th>End date</th><th>Resolution</th><th>Prices</th>
+  </tr>
+  {% for row in rows %}
+    <tr>
+      <td>{{ row.id }}</td>
+      <td>{{ row.question }}</td>
+      <td>{{ row.slug }}</td>
+      <td>{{ row.end_date }}</td>
+      <td><span class="pill">{{ row.resolution }}</span></td>
+      <td>{{ row.outcome_prices }}</td>
+    </tr>
+  {% endfor %}
+</table>
+{% endblock %}
