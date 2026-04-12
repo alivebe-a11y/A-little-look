@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Polymarket 50/50 Invalidation Edge</h1>
+<p>
+  Buy the cheap side (YES or NO trading &lt;$0.10) on markets likely to
+  invalidate &mdash; when the UMA oracle returns <code>UNKNOWN</code>, both
+  sides pay $0.50 and the cheap buy compounds ~10&times;.
+</p>
+
+<h2>Pipeline status</h2>
+<table>
+  <tr><th>Markets ingested?</th><td>{{ "yes" if status.markets_ingested else "no — run `polymarket-edge ingest`" }}</td></tr>
+  <tr><th>Labels computed?</th><td>{{ status.n_markets_labelled }} rows</td></tr>
+  <tr><th>Trades simulated?</th><td>{{ status.n_trades }} trades</td></tr>
+</table>
+
+{% if label_summary %}
+<h2>Resolution breakdown</h2>
+<table>
+  <tr><th>Resolution</th><th>Count</th></tr>
+  {% for k, v in label_summary.items() %}
+    <tr><td><a href="/labels?resolution={{ k }}">{{ k }}</a></td><td>{{ v }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+{% if trade_summary %}
+<h2>Backtest summary by feature bucket</h2>
+<table>
+  <tr>
+    <th>Bucket</th><th>n</th><th>Hit rate</th><th>Mean ROI</th><th>Total PnL</th>
+  </tr>
+  {% for row in trade_summary %}
+    <tr>
+      <td>{{ row.bucket }}</td>
+      <td>{{ row.n }}</td>
+      <td>{{ "%.1f%%"|format(row.hit_rate * 100) }}</td>
+      <td class="{{ 'pos' if row.mean_roi >= 0 else 'neg' }}">{{ "%.2fx"|format(row.mean_roi) }}</td>
+      <td class="{{ 'pos' if row.total_pnl >= 0 else 'neg' }}">${{ "%.2f"|format(row.total_pnl) }}</td>
+    </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p><em>No backtest results yet &mdash; run <code>polymarket-edge backtest</code> once the CLOB is reachable.</em></p>
+{% endif %}
+
+<h2>CLI cheat-sheet</h2>
+<pre><code>polymarket-edge ingest --since 2024-01-01
+polymarket-edge label
+polymarket-edge features
+polymarket-edge backtest --delta 24h --capital 1000
+polymarket-edge web --port 8000</code></pre>
+{% endblock %}

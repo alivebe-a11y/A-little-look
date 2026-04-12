@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}polymarket-edge{% endblock %}</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: -apple-system, system-ui, sans-serif; max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }
+    nav { display: flex; gap: 1rem; margin-bottom: 2rem; border-bottom: 1px solid #8884; padding-bottom: .75rem; }
+    nav a { text-decoration: none; font-weight: 600; }
+    nav a.active { text-decoration: underline; }
+    h1, h2 { margin-top: 1.5rem; }
+    table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+    th, td { border: 1px solid #8884; padding: .4rem .6rem; text-align: left; vertical-align: top; }
+    th { background: #8881; }
+    tr:nth-child(even) td { background: #8881; }
+    .pos { color: #1a7f1a; }
+    .neg { color: #b11818; }
+    .pill { display: inline-block; padding: .1rem .5rem; border-radius: 1rem; background: #8882; font-size: .8rem; }
+    .filters { margin: 1rem 0; }
+    .filters a { margin-right: .5rem; }
+  </style>
+</head>
+<body>
+  <nav>
+    <strong>polymarket-edge</strong>
+    <a href="/">Overview</a>
+    <a href="/labels">Labels</a>
+    <a href="/trades">Backtest</a>
+    <a href="/api/summary">API</a>
+  </nav>
+  {% block content %}{% endblock %}
+</body>
+</html>
