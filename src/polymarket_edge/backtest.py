@@ -22,6 +22,7 @@ from datetime import timedelta
 from typing import Any
 
 import pandas as pd
+from tqdm.auto import tqdm
 
 from .clients.clob import ClobClient
 from .models import Resolution
@@ -160,7 +161,7 @@ async def run_backtest(
     *,
     delta: timedelta,
     capital: float = 1000.0,
-    max_entry_price: float = 0.30,
+    max_entry_price: float = 0.10,
     limit: int | None = None,
     max_age_days: int = 140,
 ) -> pd.DataFrame:
@@ -217,10 +218,20 @@ async def run_backtest(
 
     trades: list[dict[str, Any]] = []
     token_cache: dict[str, list[str] | None] = {}
+    total = len(candidates) if limit is None else min(limit, len(candidates))
+    progress = tqdm(
+        total=total,
+        desc="backtest",
+        unit="mkt",
+        dynamic_ncols=True,
+        mininterval=1.0,
+    )
     async with ClobClient() as clob:
         count = 0
         for _, raw in candidates.iterrows():
             mid = str(raw["id"])
+            progress.update(1)
+            progress.set_postfix(trades=len(trades), refresh=False)
             label_row = labels_by_id.loc[mid]
             resolution = str(label_row["resolution"])
             closed = raw["_closed_parsed"]
@@ -268,6 +279,7 @@ async def run_backtest(
             if limit is not None and count >= limit:
                 break
             await asyncio.sleep(0.05)  # polite to the public CLOB endpoint
+    progress.close()
 
     if skip:
         print("backtest skip reasons:")
