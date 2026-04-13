@@ -160,49 +160,88 @@ async def run_backtest(
     *,
     delta: timedelta,
     capital: float = 1000.0,
-    max_entry_price: float = 0.10,
+    max_entry_price: float = 0.30,
     limit: int | None = None,
+    max_age_days: int = 140,
 ) -> pd.DataFrame:
     """Run the simulation over every labelled resolved market.
 
+    ``max_age_days`` caps how far back we look — the public CLOB
+    ``/prices-history`` endpoint only retains roughly the last 140 days
+    of data, so older markets always return empty history and would be
+    skipped anyway. Pre-filtering saves tens of thousands of HTTP calls.
+
     Returns a DataFrame of Trade rows joined with the feature vector.
+    Also prints a per-skip-reason counter so a 0-trade result is
+    diagnosable without rerunning the probe.
     """
     labels_by_id = labels_df.set_index("id")
     feats_by_id = features_df.set_index("id") if not features_df.empty else None
+
+    # Narrow markets_df to labelled, resolved, recent rows up front.
+    markets_df = markets_df.copy()
+    markets_df["id"] = markets_df["id"].astype(str)
+    labelled_ids = {str(i) for i in labels_by_id.index}
+    resolved_ids = {
+        str(i)
+        for i, row in labels_by_id.iterrows()
+        if str(row["resolution"])
+        not in (Resolution.UNRESOLVED.value, Resolution.OTHER.value)
+    }
+    keep = labelled_ids & resolved_ids
+    candidates = markets_df[markets_df["id"].isin(keep)].copy()
+    candidates["_closed_parsed"] = pd.to_datetime(
+        candidates.get("closedTime"), errors="coerce", utc=True
+    )
+    now = pd.Timestamp.now(tz="UTC")
+    candidates["_age_days"] = (now - candidates["_closed_parsed"]).dt.days
+    total_candidates = len(candidates)
+    candidates = candidates[
+        candidates["_age_days"].notna() & (candidates["_age_days"] <= max_age_days)
+    ].sort_values("_age_days")
+    print(
+        f"backtest: {total_candidates} resolved + labelled markets, "
+        f"{len(candidates)} within {max_age_days} days"
+    )
+
+    skip: dict[str, int] = {}
+
+    def _skip(reason: str) -> None:
+        skip[reason] = skip.get(reason, 0) + 1
 
     trades: list[dict[str, Any]] = []
     token_cache: dict[str, list[str] | None] = {}
     async with ClobClient() as clob:
         count = 0
-        for _, raw in markets_df.iterrows():
-            mid = str(raw.get("id"))
-            if mid not in labels_by_id.index:
-                continue
+        for _, raw in candidates.iterrows():
+            mid = str(raw["id"])
             label_row = labels_by_id.loc[mid]
             resolution = str(label_row["resolution"])
-            if resolution in (Resolution.UNRESOLVED.value, Resolution.OTHER.value):
+            closed = raw["_closed_parsed"]
+            if pd.isna(closed):
+                _skip("no_resolved_at")
                 continue
-            # Prefer the actual resolution timestamp (``closedTime``) from the
-            # Gamma record over the posted ``endDate`` — many markets carry
-            # placeholder ``endDate`` values (e.g. 2027-01-01) for not-yet-
-            # resolved-but-claimed outcomes.
-            resolved_at = raw.get("closedTime") or label_row.get("end_date")
-            if resolved_at is None or (isinstance(resolved_at, float) and pd.isna(resolved_at)):
-                continue
-            try:
-                end_ts = pd.Timestamp(resolved_at).timestamp()
-            except Exception:
-                continue
+            end_ts = closed.timestamp()
             target_ts = end_ts - delta.total_seconds()
 
             condition_id = raw.get("conditionId") or raw.get("condition_id")
             if not condition_id:
+                _skip("no_condition_id")
                 continue
             token_ids = await _resolve_token_ids(clob, str(condition_id), token_cache)
             if not token_ids:
+                _skip("no_clob_tokens")
                 continue
 
             entry_prices = await _fetch_entry_prices(clob, token_ids, target_ts)
+            if not any(p is not None and p > 0 for p in entry_prices):
+                _skip("no_price_at_target")
+                continue
+            cheap = min(p for p in entry_prices if p is not None and p > 0)
+            if cheap > max_entry_price:
+                _skip(f"too_expensive_gt_{max_entry_price:.2f}")
+                continue
+
             trade = simulate_trade(
                 market_id=mid,
                 slug=str(raw.get("slug", "")),
@@ -212,6 +251,7 @@ async def run_backtest(
                 max_entry_price=max_entry_price,
             )
             if trade is None:
+                _skip("simulate_returned_none")
                 continue
             row = trade.as_dict()
             if feats_by_id is not None and mid in feats_by_id.index:
@@ -222,6 +262,11 @@ async def run_backtest(
             if limit is not None and count >= limit:
                 break
             await asyncio.sleep(0.05)  # polite to the public CLOB endpoint
+
+    if skip:
+        print("backtest skip reasons:")
+        for reason, n in sorted(skip.items(), key=lambda kv: -kv[1]):
+            print(f"  {n:5d}  {reason}")
     return pd.DataFrame(trades)
 
 

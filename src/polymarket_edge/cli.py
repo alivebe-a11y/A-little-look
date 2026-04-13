@@ -72,6 +72,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
             capital=args.capital,
             max_entry_price=args.max_entry_price,
             limit=args.limit,
+            max_age_days=args.max_age_days,
         )
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -139,8 +140,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--out", type=Path, default=Path("data/reports/trades.csv"))
     s.add_argument("--delta", default="24h")
     s.add_argument("--capital", type=float, default=1000.0)
-    s.add_argument("--max-entry-price", type=float, default=0.10)
+    s.add_argument("--max-entry-price", type=float, default=0.30)
     s.add_argument("--limit", type=int, default=None)
+    s.add_argument(
+        "--max-age-days",
+        type=int,
+        default=140,
+        help="skip markets resolved longer ago than this (CLOB retention ~140d)",
+    )
     s.set_defaults(func=cmd_backtest)
 
     s = sub.add_parser("web", help="serve the FastAPI web UI")
