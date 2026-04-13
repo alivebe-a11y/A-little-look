@@ -1,7 +1,7 @@
 services:
   web:
-    build: .
-    image: polymarket-edge:latest
+    image: ghcr.io/alivebe-a11y/a-little-look:latest
+    pull_policy: always
     container_name: polymarket-edge-web
     ports:
       - "8000:8000"
@@ -21,7 +21,8 @@ services:
 
   # One-shot helper: `docker compose run --rm ingest`
   ingest:
-    image: polymarket-edge:latest
+    image: ghcr.io/alivebe-a11y/a-little-look:latest
+    pull_policy: always
     profiles: ["jobs"]
     depends_on:
       - web

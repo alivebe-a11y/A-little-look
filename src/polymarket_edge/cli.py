@@ -99,7 +99,13 @@ def cmd_report(args: argparse.Namespace) -> int:
     if not args.trades.exists():
         print(f"no trades file at {args.trades} — run backtest first", file=sys.stderr)
         return 1
-    trades = pd.read_csv(args.trades)
+    try:
+        trades = pd.read_csv(args.trades)
+    except pd.errors.EmptyDataError:
+        trades = pd.DataFrame()
+    if trades.empty:
+        print(f"{args.trades} has no trades — backtest produced 0 rows")
+        return 0
     summary = bt.summarize_backtest(trades)
     print(summary.to_string(index=False))
     return 0
