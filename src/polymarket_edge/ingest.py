@@ -22,11 +22,18 @@ async def ingest_markets(
     """Fetch markets from Gamma and write to parquet. Returns row count."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
-    async with GammaClient() as gc:
-        async for m in gc.iter_markets(
-            closed=closed, start_date_min=start_date_min, max_pages=max_pages
-        ):
-            rows.append(m)
+    try:
+        async with GammaClient() as gc:
+            async for m in gc.iter_markets(
+                closed=closed, start_date_min=start_date_min, max_pages=max_pages
+            ):
+                rows.append(m)
+    except Exception:
+        # Persist whatever we've fetched so a long ingest doesn't lose
+        # hundreds of thousands of markets to a single transient error.
+        if rows:
+            pd.DataFrame(_flatten_for_parquet(rows)).to_parquet(out_path, index=False)
+        raise
     if not rows:
         return 0
 

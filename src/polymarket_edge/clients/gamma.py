@@ -61,6 +61,11 @@ class GammaClient:
                 params["start_date_min"] = start_date_min
 
             resp = await self._client.get(f"{self.base_url}/markets", params=params)
+            # Gamma returns 4xx (observed: 422) once the offset exceeds the
+            # server's max page window. Treat those as end-of-pagination
+            # rather than a hard error so partial ingests still succeed.
+            if resp.status_code in (400, 416, 422):
+                return
             resp.raise_for_status()
             batch = resp.json()
             if not isinstance(batch, list) or not batch:
