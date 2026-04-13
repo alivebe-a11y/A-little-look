@@ -15,6 +15,7 @@ RUN apt-get update \
 # Install deps first for better layer caching.
 COPY pyproject.toml README.md ./
 COPY src ./src
+COPY scripts ./scripts
 RUN pip install --upgrade pip && pip install .
 
 # Data lives on a mounted volume in production.
