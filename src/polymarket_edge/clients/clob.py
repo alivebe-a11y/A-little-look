@@ -41,11 +41,14 @@ class ClobClient:
         token_id: str,
         *,
         interval: str = "max",
-        fidelity: int | None = None,
+        fidelity: int | None = 1440,
     ) -> list[dict[str, Any]]:
         """Return list of {t: unix_seconds, p: price} points for a token.
 
         The CLOB `/prices-history` endpoint returns bucketed trade history.
+        With ``interval="max"`` and no ``fidelity`` the server caps the
+        window at ~30 days. Passing ``fidelity=1440`` (1 bucket per day)
+        stretches that to ~140 days, which is what the backtest needs.
         """
         assert self._client is not None, "use ClobClient as an async context manager"
         params: dict[str, Any] = {"market": token_id, "interval": interval}
@@ -55,6 +58,22 @@ class ClobClient:
         resp.raise_for_status()
         data = resp.json()
         return data.get("history", []) if isinstance(data, dict) else []
+
+    async def get_market(self, condition_id: str) -> dict[str, Any] | None:
+        """Fetch CLOB market metadata by condition_id.
+
+        Returns the decoded JSON (including ``tokens: [{token_id, outcome}]``),
+        or ``None`` if the market isn't known to CLOB. Gamma's own
+        ``clobTokenIds`` field is unreliable — look up the real token IDs
+        here before querying price history.
+        """
+        assert self._client is not None, "use ClobClient as an async context manager"
+        resp = await self._client.get(f"{self.base_url}/markets/{condition_id}")
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        body = resp.json()
+        return body if isinstance(body, dict) else None
 
     @staticmethod
     def price_at(

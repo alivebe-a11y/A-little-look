@@ -106,6 +106,35 @@ def simulate_trade(
     )
 
 
+async def _resolve_token_ids(
+    clob: ClobClient,
+    condition_id: str,
+    cache: dict[str, list[str] | None],
+) -> list[str] | None:
+    """Look up real CLOB token IDs for a market. Cached per condition_id.
+
+    Gamma's own ``clobTokenIds`` often disagree with the actual ERC1155
+    ids CLOB serves price history under, so we hit CLOB's
+    ``/markets/<condition_id>`` to get the authoritative pair.
+    """
+    if condition_id in cache:
+        return cache[condition_id]
+    try:
+        meta = await clob.get_market(condition_id)
+    except Exception:
+        cache[condition_id] = None
+        return None
+    toks: list[str] = []
+    if meta:
+        for t in meta.get("tokens", []) or []:
+            tid = t.get("token_id")
+            if tid:
+                toks.append(str(tid))
+    result = toks if len(toks) >= 2 else None
+    cache[condition_id] = result
+    return result
+
+
 async def _fetch_entry_prices(
     clob: ClobClient,
     token_ids: list[str],
@@ -114,7 +143,7 @@ async def _fetch_entry_prices(
     out: list[float | None] = []
     for tid in token_ids[:2]:  # only binary markets
         try:
-            history = await clob.price_history(tid, interval="max")
+            history = await clob.price_history(tid, interval="max", fidelity=1440)
         except Exception:
             out.append(None)
             continue
@@ -142,6 +171,7 @@ async def run_backtest(
     feats_by_id = features_df.set_index("id") if not features_df.empty else None
 
     trades: list[dict[str, Any]] = []
+    token_cache: dict[str, list[str] | None] = {}
     async with ClobClient() as clob:
         count = 0
         for _, raw in markets_df.iterrows():
@@ -152,20 +182,24 @@ async def run_backtest(
             resolution = str(label_row["resolution"])
             if resolution in (Resolution.UNRESOLVED.value, Resolution.OTHER.value):
                 continue
-            end_date = label_row["end_date"]
-            if pd.isna(end_date):
+            # Prefer the actual resolution timestamp (``closedTime``) from the
+            # Gamma record over the posted ``endDate`` — many markets carry
+            # placeholder ``endDate`` values (e.g. 2027-01-01) for not-yet-
+            # resolved-but-claimed outcomes.
+            resolved_at = raw.get("closedTime") or label_row.get("end_date")
+            if resolved_at is None or (isinstance(resolved_at, float) and pd.isna(resolved_at)):
                 continue
-            end_ts = pd.Timestamp(end_date).timestamp()
+            try:
+                end_ts = pd.Timestamp(resolved_at).timestamp()
+            except Exception:
+                continue
             target_ts = end_ts - delta.total_seconds()
 
-            token_ids = raw.get("clobTokenIds") or raw.get("clob_token_ids") or []
-            if isinstance(token_ids, str):
-                try:
-                    import json
-                    token_ids = json.loads(token_ids)
-                except Exception:
-                    token_ids = []
-            if not isinstance(token_ids, list) or len(token_ids) < 2:
+            condition_id = raw.get("conditionId") or raw.get("condition_id")
+            if not condition_id:
+                continue
+            token_ids = await _resolve_token_ids(clob, str(condition_id), token_cache)
+            if not token_ids:
                 continue
 
             entry_prices = await _fetch_entry_prices(clob, token_ids, target_ts)
