@@ -109,6 +109,25 @@ def cmd_report(args: argparse.Namespace) -> int:
         return 0
     summary = bt.summarize_backtest(trades)
     print(summary.to_string(index=False))
+
+    # Concentration check: how much of total PnL is driven by the top N wins?
+    # If the "edge" is really 3 lucky markets, we want to see it clearly.
+    sorted_by_pnl = trades.sort_values("pnl", ascending=False)
+    total_pnl = float(trades["pnl"].sum())
+    print("\ntop 20 winners (most pnl):")
+    top_cols = [c for c in ["slug", "resolution", "entry_price", "pnl", "roi"] if c in trades.columns]
+    print(sorted_by_pnl.head(20)[top_cols].to_string(index=False))
+    top20_pnl = float(sorted_by_pnl.head(20)["pnl"].sum())
+    top5_pnl = float(sorted_by_pnl.head(5)["pnl"].sum())
+    print(
+        f"\nconcentration: top-5 winners = ${top5_pnl:,.0f}, "
+        f"top-20 winners = ${top20_pnl:,.0f}, total = ${total_pnl:,.0f}"
+    )
+    if total_pnl != 0:
+        print(
+            f"  top-5 share: {top5_pnl / total_pnl:+.1%}  "
+            f"top-20 share: {top20_pnl / total_pnl:+.1%}"
+        )
     return 0
 
 
@@ -140,7 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--out", type=Path, default=Path("data/reports/trades.csv"))
     s.add_argument("--delta", default="24h")
     s.add_argument("--capital", type=float, default=1000.0)
-    s.add_argument("--max-entry-price", type=float, default=0.30)
+    s.add_argument("--max-entry-price", type=float, default=0.10)
     s.add_argument("--limit", type=int, default=None)
     s.add_argument(
         "--max-age-days",
