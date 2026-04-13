@@ -175,8 +175,14 @@ async def run_backtest(
     Also prints a per-skip-reason counter so a 0-trade result is
     diagnosable without rerunning the probe.
     """
+    labels_df = labels_df.copy()
+    labels_df["id"] = labels_df["id"].astype(str)
     labels_by_id = labels_df.set_index("id")
-    feats_by_id = features_df.set_index("id") if not features_df.empty else None
+    feats_by_id = None
+    if not features_df.empty:
+        features_df = features_df.copy()
+        features_df["id"] = features_df["id"].astype(str)
+        feats_by_id = features_df.set_index("id")
 
     # Narrow markets_df to labelled, resolved, recent rows up front.
     markets_df = markets_df.copy()
