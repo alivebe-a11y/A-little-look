@@ -75,6 +75,25 @@ class ClobClient:
         body = resp.json()
         return body if isinstance(body, dict) else None
 
+    async def get_book(self, token_id: str) -> dict[str, Any] | None:
+        """Fetch the current L2 orderbook for a CLOB token.
+
+        Returns ``{asset_id, bids: [{price, size}], asks: [{price, size}], hash}``
+        or ``None`` if the market isn't open/known. Used for market-selection
+        research — wide spreads + shallow depth are quotable; tight spreads or
+        near-zero depth mean no MM edge.
+
+        Both ``bids`` and ``asks`` come sorted best-first on Polymarket, but
+        don't rely on that; callers that care should re-sort.
+        """
+        assert self._client is not None, "use ClobClient as an async context manager"
+        resp = await self._client.get(f"{self.base_url}/book", params={"token_id": token_id})
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        body = resp.json()
+        return body if isinstance(body, dict) else None
+
     @staticmethod
     def price_at(
         history: list[dict[str, Any]], target_ts: float

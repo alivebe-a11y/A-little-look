@@ -9,6 +9,7 @@ from pathlib import Path
 import pandas as pd
 
 from . import backtest as bt
+from . import books as bk
 from .backtest import _resolve_token_ids
 from .clients.clob import ClobClient
 from .clients.subgraph import SubgraphAuthError, SubgraphClient, derive_price_and_side
@@ -357,6 +358,51 @@ def cmd_backtest_subgraph(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ingest_books(args: argparse.Namespace) -> int:
+    markets = bk.load_markets_or_die(args.in_path)
+    paths = asyncio.run(
+        bk.ingest_books_loop(
+            markets,
+            out_dir=args.out_dir,
+            interval_seconds=args.interval,
+            duration_seconds=args.duration,
+            market_limit=args.limit,
+            concurrency=args.concurrency,
+        )
+    )
+    print(f"wrote {len(paths)} snapshot file(s) to {args.out_dir}")
+    return 0
+
+
+def cmd_analyze_books(args: argparse.Namespace) -> int:
+    try:
+        ranked = bk.analyze_books(
+            books_dir=args.books_dir,
+            out_path=args.out,
+            min_snapshots=args.min_snapshots,
+            min_spread=args.min_spread,
+        )
+    except FileNotFoundError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    print(f"wrote {len(ranked)} ranked tokens to {args.out}")
+    cols = [
+        "slug",
+        "outcome_index",
+        "n_snapshots",
+        "median_spread",
+        "mean_mid",
+        "mid_vol",
+        "geo_depth",
+        "quotable",
+        "score",
+    ]
+    cols = [c for c in cols if c in ranked.columns]
+    head = ranked[cols].head(args.top)
+    print(head.to_string(index=False))
+    return 0
+
+
 def cmd_web(args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -491,6 +537,34 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--capital", type=float, default=1000.0)
     s.add_argument("--max-entry-price", type=float, default=0.10)
     s.set_defaults(func=cmd_backtest_subgraph)
+
+    s = sub.add_parser(
+        "ingest-books",
+        help="snapshot orderbooks for open markets on a schedule (MM research, Phase A)",
+    )
+    s.add_argument("--in-path", type=Path, default=DEFAULT_RAW_PATH)
+    s.add_argument("--out-dir", type=Path, default=bk.BOOKS_DIR)
+    s.add_argument("--interval", type=int, default=300, help="seconds between snapshots")
+    s.add_argument("--duration", type=int, default=3600, help="total seconds to run for")
+    s.add_argument("--limit", type=int, default=None, help="cap # markets per snapshot")
+    s.add_argument("--concurrency", type=int, default=10, help="parallel /book fetches")
+    s.set_defaults(func=cmd_ingest_books)
+
+    s = sub.add_parser(
+        "analyze-books",
+        help="rank markets by MM quotability using snapshots from ingest-books",
+    )
+    s.add_argument("--books-dir", type=Path, default=bk.BOOKS_DIR)
+    s.add_argument("--out", type=Path, default=bk.DEFAULT_BOOK_ANALYSIS_PATH)
+    s.add_argument("--min-snapshots", type=int, default=3)
+    s.add_argument(
+        "--min-spread",
+        type=float,
+        default=bk.MIN_QUOTABLE_SPREAD,
+        help="spread floor below which markets are flagged unquotable",
+    )
+    s.add_argument("--top", type=int, default=30, help="rows to print to stdout")
+    s.set_defaults(func=cmd_analyze_books)
 
     s = sub.add_parser("web", help="serve the FastAPI web UI")
     s.add_argument("--host", default="0.0.0.0")
