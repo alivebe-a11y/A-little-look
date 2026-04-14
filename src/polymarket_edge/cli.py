@@ -9,12 +9,14 @@ from pathlib import Path
 import pandas as pd
 
 from . import backtest as bt
+from .clients.subgraph import SubgraphAuthError, SubgraphClient
 from .features import compute_features
 from .ingest import DEFAULT_RAW_PATH, ingest_markets, load_raw_markets
 from .label import DEFAULT_LABELS_PATH, label_dataframe, summarize
-from .models import Market
+from .models import Market, Resolution
 
 DEFAULT_FEATURES_PATH = Path("data/reports/features.csv")
+DEFAULT_TRADES_SUBGRAPH_PATH = Path("data/raw/trades_subgraph.parquet")
 
 
 def cmd_ingest(args: argparse.Namespace) -> int:
@@ -81,6 +83,91 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     if not trades.empty:
         print("summary:")
         print(bt.summarize_backtest(trades).to_string(index=False))
+    return 0
+
+
+async def _ingest_trades(
+    markets: pd.DataFrame,
+    labels: pd.DataFrame,
+    *,
+    out_path: Path,
+    resolutions: set[str],
+    limit: int | None,
+    per_market_limit: int | None,
+) -> int:
+    """Pull trades for target markets from the subgraph and cache to parquet.
+
+    ``resolutions`` filters which labelled rows to include (default: just
+    FIFTY_FIFTY since that's the thesis we're testing). ``per_market_limit``
+    caps trade count per market to keep API usage predictable on the free
+    tier (100k queries/mo).
+    """
+    labels = labels.copy()
+    labels["id"] = labels["id"].astype(str)
+    target_ids = {
+        str(row["id"])
+        for _, row in labels.iterrows()
+        if str(row["resolution"]) in resolutions
+    }
+
+    markets = markets.copy()
+    markets["id"] = markets["id"].astype(str)
+    target = markets[markets["id"].isin(target_ids)]
+    target = target[target.get("conditionId").notna()] if "conditionId" in target.columns else target
+    if limit is not None:
+        target = target.head(limit)
+
+    out_rows: list[dict[str, object]] = []
+    from tqdm.auto import tqdm
+
+    progress = tqdm(total=len(target), desc="subgraph", unit="mkt", dynamic_ncols=True)
+    async with SubgraphClient() as sg:
+        for _, raw in target.iterrows():
+            progress.update(1)
+            mid = str(raw["id"])
+            cid = raw.get("conditionId") or raw.get("condition_id")
+            if not cid:
+                continue
+            try:
+                trades = await sg.trades_for_condition(str(cid), first=per_market_limit)
+            except Exception as e:
+                print(f"  {mid} {cid}: {e}", file=sys.stderr)
+                continue
+            for t in trades:
+                t = dict(t)
+                t["market_id"] = mid
+                t["conditionId"] = str(cid)
+                out_rows.append(t)
+    progress.close()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if not out_rows:
+        pd.DataFrame().to_parquet(out_path, index=False)
+        return 0
+    df = pd.DataFrame(out_rows)
+    df.to_parquet(out_path, index=False)
+    return len(df)
+
+
+def cmd_ingest_trades(args: argparse.Namespace) -> int:
+    markets = load_raw_markets(args.in_path)
+    labels = pd.read_csv(args.labels)
+    resolutions = set(args.resolutions.split(",")) if args.resolutions else {Resolution.FIFTY_FIFTY.value}
+    try:
+        n = asyncio.run(
+            _ingest_trades(
+                markets,
+                labels,
+                out_path=args.out,
+                resolutions=resolutions,
+                limit=args.limit,
+                per_market_limit=args.per_market_limit,
+            )
+        )
+    except SubgraphAuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    print(f"wrote {n} trade rows to {args.out}")
     return 0
 
 
@@ -168,6 +255,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip markets resolved longer ago than this (CLOB retention ~140d)",
     )
     s.set_defaults(func=cmd_backtest)
+
+    s = sub.add_parser(
+        "ingest-trades",
+        help="pull historical trades from the Polymarket subgraph (full history, needs THEGRAPH_API_KEY)",
+    )
+    s.add_argument("--in-path", type=Path, default=DEFAULT_RAW_PATH)
+    s.add_argument("--labels", type=Path, default=DEFAULT_LABELS_PATH)
+    s.add_argument("--out", type=Path, default=DEFAULT_TRADES_SUBGRAPH_PATH)
+    s.add_argument(
+        "--resolutions",
+        default=Resolution.FIFTY_FIFTY.value,
+        help="comma-separated resolutions to fetch (default: FIFTY_FIFTY only)",
+    )
+    s.add_argument("--limit", type=int, default=None, help="max markets to fetch")
+    s.add_argument(
+        "--per-market-limit",
+        type=int,
+        default=None,
+        help="cap trades per market (default: unlimited — paginates fully)",
+    )
+    s.set_defaults(func=cmd_ingest_trades)
 
     s = sub.add_parser("web", help="serve the FastAPI web UI")
     s.add_argument("--host", default="0.0.0.0")
