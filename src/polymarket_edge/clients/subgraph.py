@@ -1,4 +1,4 @@
-"""Client for the Polymarket orderbook subgraph on The Graph.
+"""Client for a Polymarket subgraph on The Graph.
 
 The public CLOB ``/prices-history`` endpoint only retains ~140 days.
 Subgraph indexing goes back to contract deployment, which is what we
@@ -10,8 +10,16 @@ Requires a The Graph API key (free tier: 100k queries/mo). Set in
 ``.env`` as ``THEGRAPH_API_KEY``. If unset, every call raises a
 clear error — no silent empty-response path.
 
-Subgraph ID (mainnet Polygon, Polymarket orderbook):
-    Bx1W4S7kDVxs9gC3s2G6DS8kdNBJNVhMviCtin2DiBp
+Polymarket publishes several subgraphs; they don't share a schema:
+  * CTF / positions  (``Bx1W4S7kDVxs9gC3s2G6DS8kdNBJNVhMviCtin2DiBp``)
+      — splits, merges, redemptions, positions. **No trade history.**
+  * orderbook / orders-matched — trade fills with prices. This is
+      what backtesting wants. Find the current ID on
+      https://thegraph.com/explorer (search "polymarket" and look
+      for one with ``orderFilledEvents`` / ``ordersMatched``).
+
+Override via ``THEGRAPH_SUBGRAPH_ID`` env var so swapping subgraphs
+doesn't need a rebuild.
 
 Gateway endpoint format:
     https://gateway.thegraph.com/api/{api_key}/subgraphs/id/{subgraph_id}
@@ -23,6 +31,9 @@ from typing import Any
 
 import httpx
 
+# Defaults to the CTF/positions subgraph (what Polymarket originally
+# documented under that ID). Override with THEGRAPH_SUBGRAPH_ID to point
+# at the orderbook subgraph.
 DEFAULT_SUBGRAPH_ID = "Bx1W4S7kDVxs9gC3s2G6DS8kdNBJNVhMviCtin2DiBp"
 DEFAULT_GATEWAY = "https://gateway.thegraph.com/api"
 
@@ -35,14 +46,18 @@ class SubgraphClient:
     def __init__(
         self,
         api_key: str | None = None,
-        subgraph_id: str = DEFAULT_SUBGRAPH_ID,
+        subgraph_id: str | None = None,
         gateway: str = DEFAULT_GATEWAY,
         client: httpx.AsyncClient | None = None,
         request_timeout: float = 30.0,
         page_size: int = 1000,
     ) -> None:
         self.api_key = api_key or os.environ.get("THEGRAPH_API_KEY")
-        self.subgraph_id = subgraph_id
+        self.subgraph_id = (
+            subgraph_id
+            or os.environ.get("THEGRAPH_SUBGRAPH_ID")
+            or DEFAULT_SUBGRAPH_ID
+        )
         self.gateway = gateway.rstrip("/")
         self._client = client
         self._owns_client = client is None
