@@ -289,11 +289,30 @@ async def run_backtest(
 
 
 def summarize_backtest(trades: pd.DataFrame) -> pd.DataFrame:
-    """Produce per-feature-bucket summary: n, hit_rate, mean_roi, total_pnl."""
+    """Produce per-feature-bucket summary: n, hit_rate, mean_roi, total_pnl.
+
+    Also buckets by ``entry_price`` band (``<1c``, ``1-2c``, ``2-5c``,
+    ``5-10c``) because the $0.10 runs showed the real driver of the
+    positive-EV buckets is actually "entry price is tiny," not any of
+    the hand-rolled features. Surfacing this directly lets us see
+    whether a given feature actually has predictive power independent
+    of the price it selects for.
+    """
     if trades.empty:
         return pd.DataFrame(columns=["bucket", "n", "hit_rate", "mean_roi", "total_pnl"])
     rows = []
     rows.append(_bucket_stats("ALL", trades))
+    if "entry_price" in trades.columns:
+        price_bands = [
+            ("price_<0.01", trades[trades["entry_price"] < 0.01]),
+            ("price_0.01-0.02", trades[(trades["entry_price"] >= 0.01) & (trades["entry_price"] < 0.02)]),
+            ("price_0.02-0.05", trades[(trades["entry_price"] >= 0.02) & (trades["entry_price"] < 0.05)]),
+            ("price_0.05-0.10", trades[(trades["entry_price"] >= 0.05) & (trades["entry_price"] < 0.10)]),
+            ("price_>=0.10", trades[trades["entry_price"] >= 0.10]),
+        ]
+        for name, sub in price_bands:
+            if not sub.empty:
+                rows.append(_bucket_stats(name, sub))
     for col in [c for c in trades.columns if c.startswith("feat_")]:
         positive = trades[trades[col] == True]  # noqa: E712
         negative = trades[trades[col] == False]  # noqa: E712
