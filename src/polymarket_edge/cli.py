@@ -359,10 +359,8 @@ def cmd_backtest_subgraph(args: argparse.Namespace) -> int:
 
 
 def cmd_ingest_books(args: argparse.Namespace) -> int:
-    markets = bk.load_markets_or_die(args.in_path)
     paths = asyncio.run(
         bk.ingest_books_loop(
-            markets,
             out_dir=args.out_dir,
             interval_seconds=args.interval,
             duration_seconds=args.duration,
@@ -542,7 +540,6 @@ def build_parser() -> argparse.ArgumentParser:
         "ingest-books",
         help="snapshot orderbooks for open markets on a schedule (MM research, Phase A)",
     )
-    s.add_argument("--in-path", type=Path, default=DEFAULT_RAW_PATH)
     s.add_argument("--out-dir", type=Path, default=bk.BOOKS_DIR)
     s.add_argument("--interval", type=int, default=300, help="seconds between snapshots")
     s.add_argument("--duration", type=int, default=3600, help="total seconds to run for")

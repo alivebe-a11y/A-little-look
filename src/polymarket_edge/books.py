@@ -27,6 +27,7 @@ from typing import Any
 import pandas as pd
 
 from .clients.clob import ClobClient
+from .clients.gamma import GammaClient
 from .ingest import load_raw_markets
 
 BOOKS_DIR = Path("data/raw/books")
@@ -121,65 +122,73 @@ async def _snapshot_one(
     }
 
 
-async def _collect_targets(
-    markets_df: pd.DataFrame,
+async def _collect_targets_live(
     clob: ClobClient,
     limit: int | None,
+    *,
+    max_pages: int | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
-    """Resolve (token_id, meta) pairs for every open, known-to-CLOB market."""
-    if "closed" in markets_df.columns:
-        open_markets = markets_df[markets_df["closed"] != True]  # noqa: E712
-    else:
-        open_markets = markets_df
-    if limit is not None:
-        open_markets = open_markets.head(limit)
+    """Fetch open markets from Gamma and resolve (token_id, meta) for each.
 
+    We pull fresh from Gamma every time rather than reusing an on-disk
+    parquet. Markets open and close daily — an MM research run wants the
+    universe that's actually tradeable *now*, not a snapshot from last
+    week. Gamma's ``closed=false`` filter is the source of truth.
+    """
     targets: list[tuple[str, dict[str, Any]]] = []
-    for _, raw in open_markets.iterrows():
-        cid = raw.get("conditionId") or raw.get("condition_id")
-        if not cid:
-            continue
-        try:
-            mkt = await clob.get_market(str(cid))
-        except Exception:
-            continue
-        if not mkt:
-            continue
-        for idx, tok in enumerate((mkt.get("tokens") or [])[:2]):
-            tid = tok.get("token_id")
-            if not tid:
+    seen = 0
+    async with GammaClient() as gc:
+        async for raw in gc.iter_markets(closed=False, max_pages=max_pages):
+            if limit is not None and seen >= limit:
+                break
+            cid = raw.get("conditionId") or raw.get("condition_id")
+            if not cid:
                 continue
-            targets.append(
-                (
-                    str(tid),
-                    {
-                        "market_id": str(raw.get("id", "")),
-                        "slug": str(raw.get("slug", "")),
-                        "condition_id": str(cid),
-                        "outcome_index": idx,
-                    },
+            try:
+                mkt = await clob.get_market(str(cid))
+            except Exception:
+                continue
+            if not mkt:
+                continue
+            for idx, tok in enumerate((mkt.get("tokens") or [])[:2]):
+                tid = tok.get("token_id")
+                if not tid:
+                    continue
+                targets.append(
+                    (
+                        str(tid),
+                        {
+                            "market_id": str(raw.get("id", "")),
+                            "slug": str(raw.get("slug", "")),
+                            "condition_id": str(cid),
+                            "outcome_index": idx,
+                        },
+                    )
                 )
-            )
+            seen += 1
     return targets
 
 
 async def snapshot_once(
-    markets_df: pd.DataFrame,
     out_dir: Path = BOOKS_DIR,
     *,
     market_limit: int | None = None,
     concurrency: int = 10,
-) -> Path | None:
+    targets: list[tuple[str, dict[str, Any]]] | None = None,
+) -> tuple[Path | None, list[tuple[str, dict[str, Any]]]]:
     """Grab one orderbook snapshot across all open markets and write a parquet.
 
-    Returns the file path, or None if nothing was snapshotted.
+    If ``targets`` is provided, reuse it (avoids re-resolving tokens on
+    every loop iteration). Returns (path_or_none, targets_used) so the
+    caller can cache targets across successive snapshots.
     """
     from tqdm.auto import tqdm
 
     out_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
     async with ClobClient() as clob:
-        targets = await _collect_targets(markets_df, clob, market_limit)
+        if targets is None:
+            targets = await _collect_targets_live(clob, market_limit)
         sem = asyncio.Semaphore(concurrency)
         progress = tqdm(total=len(targets), desc="books", unit="tok", dynamic_ncols=True)
 
@@ -194,34 +203,47 @@ async def snapshot_once(
         progress.close()
 
     if not rows:
-        return None
+        return None, targets
     df = pd.DataFrame(rows)
     ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d-%H%M%S")
     out_path = out_dir / f"books-{ts}.parquet"
     df.to_parquet(out_path, index=False)
-    return out_path
+    return out_path, targets
 
 
 async def ingest_books_loop(
-    markets_df: pd.DataFrame,
     out_dir: Path = BOOKS_DIR,
     *,
     interval_seconds: int = 300,
     duration_seconds: int,
     market_limit: int | None = None,
     concurrency: int = 10,
+    refresh_targets_every: int = 12,
 ) -> list[Path]:
-    """Repeatedly snapshot books until ``duration_seconds`` elapses."""
+    """Repeatedly snapshot books until ``duration_seconds`` elapses.
+
+    Re-resolves the open-markets universe every ``refresh_targets_every``
+    iterations (default: every 12 iterations = 1h at 5-min cadence) so
+    newly-created markets get picked up and resolved ones drop out.
+    """
     start = time.time()
     written: list[Path] = []
+    targets: list[tuple[str, dict[str, Any]]] | None = None
+    iteration = 0
     while True:
         loop_started = time.time()
-        path = await snapshot_once(
-            markets_df, out_dir, market_limit=market_limit, concurrency=concurrency
+        if iteration % refresh_targets_every == 0:
+            targets = None  # force re-resolution from Gamma
+        path, targets = await snapshot_once(
+            out_dir,
+            market_limit=market_limit,
+            concurrency=concurrency,
+            targets=targets,
         )
         if path is not None:
             written.append(path)
             print(f"  snapshot -> {path} ({path.stat().st_size} bytes)")
+        iteration += 1
         if time.time() - start + interval_seconds >= duration_seconds:
             break
         elapsed = time.time() - loop_started
