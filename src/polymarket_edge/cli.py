@@ -257,6 +257,106 @@ def cmd_ingest_trades(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backtest_subgraph(args: argparse.Namespace) -> int:
+    """Replay cheap-side strategy using the subgraph trade cache.
+
+    Unlike the CLOB-backed backtest, this has full history (not just 140
+    days), so we can actually measure the cheap-side strategy on the
+    ~519 FIFTY_FIFTY markets instead of the ~20 that fit the CLOB window.
+    """
+    if not args.trades.exists():
+        print(f"no trades file at {args.trades} — run ingest-trades first", file=sys.stderr)
+        return 1
+    trades = pd.read_parquet(args.trades)
+    if trades.empty:
+        print("trades file is empty")
+        return 0
+
+    markets = load_raw_markets(args.in_path)
+    markets["id"] = markets["id"].astype(str)
+    labels = pd.read_csv(args.labels)
+    labels["id"] = labels["id"].astype(str)
+    labels_by_id = labels.set_index("id")
+
+    markets["_closed"] = pd.to_datetime(markets.get("closedTime"), errors="coerce", utc=True)
+
+    delta = bt.parse_delta(args.delta)
+    capital = args.capital
+    max_entry = args.max_entry_price
+
+    # For each (market, outcome) find the last trade at or before target_ts.
+    trades = trades.sort_values("timestamp_ts")
+    simulated: list[dict[str, object]] = []
+    skip: dict[str, int] = {}
+
+    def _skip(r: str) -> None:
+        skip[r] = skip.get(r, 0) + 1
+
+    for mid, market_trades in trades.groupby("market_id"):
+        mid = str(mid)
+        if mid not in labels_by_id.index:
+            _skip("no_label")
+            continue
+        resolution = str(labels_by_id.loc[mid]["resolution"])
+        mrow = markets[markets["id"] == mid]
+        if mrow.empty or pd.isna(mrow["_closed"].iloc[0]):
+            _skip("no_closed_time")
+            continue
+        target_ts = mrow["_closed"].iloc[0].timestamp() - delta.total_seconds()
+
+        prior = market_trades[market_trades["timestamp_ts"] <= target_ts]
+        if prior.empty:
+            _skip("no_trade_before_target")
+            continue
+        entry_by_outcome: dict[int, float] = {}
+        for oi in (0, 1):
+            side_trades = prior[prior["outcome_index"] == oi]
+            if side_trades.empty:
+                continue
+            entry_by_outcome[oi] = float(side_trades["price"].iloc[-1])
+        if not entry_by_outcome:
+            _skip("no_price_either_side")
+            continue
+
+        side_index = min(entry_by_outcome, key=lambda k: entry_by_outcome[k])
+        entry_price = entry_by_outcome[side_index]
+        if entry_price <= 0:
+            _skip("zero_price")
+            continue
+        if entry_price > max_entry:
+            _skip(f"too_expensive_gt_{max_entry:.2f}")
+            continue
+
+        shares = capital / entry_price
+        payout_per_share = bt.payout_for(resolution, side_index)
+        pnl = shares * payout_per_share - capital
+        simulated.append(
+            {
+                "market_id": mid,
+                "slug": str(mrow["slug"].iloc[0]) if "slug" in mrow.columns else "",
+                "resolution": resolution,
+                "entry_price": entry_price,
+                "side_index": side_index,
+                "payout_per_share": payout_per_share,
+                "capital": capital,
+                "pnl": pnl,
+                "roi": pnl / capital,
+            }
+        )
+
+    out_df = pd.DataFrame(simulated)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_csv(args.out, index=False)
+    print(f"wrote {len(out_df)} simulated trades to {args.out}")
+    if skip:
+        print("skip reasons:")
+        for reason, n in sorted(skip.items(), key=lambda kv: -kv[1]):
+            print(f"  {n:5d}  {reason}")
+    if not out_df.empty:
+        print(bt.summarize_backtest(out_df).to_string(index=False))
+    return 0
+
+
 def cmd_web(args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -378,6 +478,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="cap trades per market (default: unlimited — paginates fully)",
     )
     s.set_defaults(func=cmd_ingest_trades)
+
+    s = sub.add_parser(
+        "backtest-subgraph",
+        help="cheap-side backtest against trades_subgraph.parquet (full history, not CLOB-limited)",
+    )
+    s.add_argument("--in-path", type=Path, default=DEFAULT_RAW_PATH)
+    s.add_argument("--labels", type=Path, default=DEFAULT_LABELS_PATH)
+    s.add_argument("--trades", type=Path, default=DEFAULT_TRADES_SUBGRAPH_PATH)
+    s.add_argument("--out", type=Path, default=Path("data/reports/trades_subgraph_bt.csv"))
+    s.add_argument("--delta", default="24h")
+    s.add_argument("--capital", type=float, default=1000.0)
+    s.add_argument("--max-entry-price", type=float, default=0.10)
+    s.set_defaults(func=cmd_backtest_subgraph)
 
     s = sub.add_parser("web", help="serve the FastAPI web UI")
     s.add_argument("--host", default="0.0.0.0")
