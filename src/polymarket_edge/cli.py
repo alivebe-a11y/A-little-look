@@ -149,6 +149,33 @@ async def _ingest_trades(
     return len(df)
 
 
+async def _inspect_subgraph() -> list[dict[str, object]]:
+    """Introspect the top-level Query fields of the configured subgraph.
+
+    Used to debug schema drift — the field names in our GraphQL queries
+    must match what the subgraph actually exposes. When the orderbook
+    subgraph migrates or we've grabbed the wrong ID, this is how we find
+    out without guessing.
+    """
+    gql = "{ __schema { queryType { fields { name args { name } } } } }"
+    async with SubgraphClient() as sg:
+        data = await sg.query(gql)
+    return data["__schema"]["queryType"]["fields"]
+
+
+def cmd_inspect_subgraph(args: argparse.Namespace) -> int:
+    try:
+        fields = asyncio.run(_inspect_subgraph())
+    except SubgraphAuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    for f in sorted(fields, key=lambda f: f["name"]):
+        arg_names = ", ".join(a["name"] for a in f.get("args", []))
+        print(f"  {f['name']}({arg_names})")
+    print(f"\n{len(fields)} top-level query fields")
+    return 0
+
+
 def cmd_ingest_trades(args: argparse.Namespace) -> int:
     markets = load_raw_markets(args.in_path)
     labels = pd.read_csv(args.labels)
@@ -255,6 +282,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip markets resolved longer ago than this (CLOB retention ~140d)",
     )
     s.set_defaults(func=cmd_backtest)
+
+    s = sub.add_parser(
+        "inspect-subgraph",
+        help="list the top-level query fields exposed by the subgraph (schema debug)",
+    )
+    s.set_defaults(func=cmd_inspect_subgraph)
 
     s = sub.add_parser(
         "ingest-trades",
