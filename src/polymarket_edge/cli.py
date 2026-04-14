@@ -9,7 +9,10 @@ from pathlib import Path
 import pandas as pd
 
 from . import backtest as bt
-from .clients.subgraph import SubgraphAuthError, SubgraphClient
+from . import books as bk
+from .backtest import _resolve_token_ids
+from .clients.clob import ClobClient
+from .clients.subgraph import SubgraphAuthError, SubgraphClient, derive_price_and_side
 from .features import compute_features
 from .ingest import DEFAULT_RAW_PATH, ingest_markets, load_raw_markets
 from .label import DEFAULT_LABELS_PATH, label_dataframe, summarize
@@ -121,24 +124,35 @@ async def _ingest_trades(
     from tqdm.auto import tqdm
 
     progress = tqdm(total=len(target), desc="subgraph", unit="mkt", dynamic_ncols=True)
-    async with SubgraphClient() as sg:
+    token_cache: dict[str, list[str] | None] = {}
+    skipped_no_tokens = 0
+    async with ClobClient() as clob, SubgraphClient() as sg:
         for _, raw in target.iterrows():
             progress.update(1)
             mid = str(raw["id"])
             cid = raw.get("conditionId") or raw.get("condition_id")
             if not cid:
                 continue
+            token_ids = await _resolve_token_ids(clob, str(cid), token_cache)
+            if not token_ids:
+                skipped_no_tokens += 1
+                continue
             try:
-                trades = await sg.trades_for_condition(str(cid), first=per_market_limit)
+                trades = await sg.trades_for_token_ids(
+                    token_ids[:2], first=per_market_limit
+                )
             except Exception as e:
                 print(f"  {mid} {cid}: {e}", file=sys.stderr)
                 continue
             for t in trades:
-                t = dict(t)
-                t["market_id"] = mid
-                t["conditionId"] = str(cid)
-                out_rows.append(t)
+                enriched = derive_price_and_side(t, token_ids[:2])
+                enriched["market_id"] = mid
+                enriched["conditionId"] = str(cid)
+                out_rows.append(enriched)
+            progress.set_postfix(trades=len(out_rows), refresh=False)
     progress.close()
+    if skipped_no_tokens:
+        print(f"  skipped {skipped_no_tokens} markets with no CLOB tokens", file=sys.stderr)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if not out_rows:
@@ -241,6 +255,151 @@ def cmd_ingest_trades(args: argparse.Namespace) -> int:
         print(str(e), file=sys.stderr)
         return 2
     print(f"wrote {n} trade rows to {args.out}")
+    return 0
+
+
+def cmd_backtest_subgraph(args: argparse.Namespace) -> int:
+    """Replay cheap-side strategy using the subgraph trade cache.
+
+    Unlike the CLOB-backed backtest, this has full history (not just 140
+    days), so we can actually measure the cheap-side strategy on the
+    ~519 FIFTY_FIFTY markets instead of the ~20 that fit the CLOB window.
+    """
+    if not args.trades.exists():
+        print(f"no trades file at {args.trades} — run ingest-trades first", file=sys.stderr)
+        return 1
+    trades = pd.read_parquet(args.trades)
+    if trades.empty:
+        print("trades file is empty")
+        return 0
+
+    markets = load_raw_markets(args.in_path)
+    markets["id"] = markets["id"].astype(str)
+    labels = pd.read_csv(args.labels)
+    labels["id"] = labels["id"].astype(str)
+    labels_by_id = labels.set_index("id")
+
+    markets["_closed"] = pd.to_datetime(markets.get("closedTime"), errors="coerce", utc=True)
+
+    delta = bt.parse_delta(args.delta)
+    capital = args.capital
+    max_entry = args.max_entry_price
+
+    # For each (market, outcome) find the last trade at or before target_ts.
+    trades = trades.sort_values("timestamp_ts")
+    simulated: list[dict[str, object]] = []
+    skip: dict[str, int] = {}
+
+    def _skip(r: str) -> None:
+        skip[r] = skip.get(r, 0) + 1
+
+    for mid, market_trades in trades.groupby("market_id"):
+        mid = str(mid)
+        if mid not in labels_by_id.index:
+            _skip("no_label")
+            continue
+        resolution = str(labels_by_id.loc[mid]["resolution"])
+        mrow = markets[markets["id"] == mid]
+        if mrow.empty or pd.isna(mrow["_closed"].iloc[0]):
+            _skip("no_closed_time")
+            continue
+        target_ts = mrow["_closed"].iloc[0].timestamp() - delta.total_seconds()
+
+        prior = market_trades[market_trades["timestamp_ts"] <= target_ts]
+        if prior.empty:
+            _skip("no_trade_before_target")
+            continue
+        entry_by_outcome: dict[int, float] = {}
+        for oi in (0, 1):
+            side_trades = prior[prior["outcome_index"] == oi]
+            if side_trades.empty:
+                continue
+            entry_by_outcome[oi] = float(side_trades["price"].iloc[-1])
+        if not entry_by_outcome:
+            _skip("no_price_either_side")
+            continue
+
+        side_index = min(entry_by_outcome, key=lambda k: entry_by_outcome[k])
+        entry_price = entry_by_outcome[side_index]
+        if entry_price <= 0:
+            _skip("zero_price")
+            continue
+        if entry_price > max_entry:
+            _skip(f"too_expensive_gt_{max_entry:.2f}")
+            continue
+
+        shares = capital / entry_price
+        payout_per_share = bt.payout_for(resolution, side_index)
+        pnl = shares * payout_per_share - capital
+        simulated.append(
+            {
+                "market_id": mid,
+                "slug": str(mrow["slug"].iloc[0]) if "slug" in mrow.columns else "",
+                "resolution": resolution,
+                "entry_price": entry_price,
+                "side_index": side_index,
+                "payout_per_share": payout_per_share,
+                "capital": capital,
+                "pnl": pnl,
+                "roi": pnl / capital,
+            }
+        )
+
+    out_df = pd.DataFrame(simulated)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_csv(args.out, index=False)
+    print(f"wrote {len(out_df)} simulated trades to {args.out}")
+    if skip:
+        print("skip reasons:")
+        for reason, n in sorted(skip.items(), key=lambda kv: -kv[1]):
+            print(f"  {n:5d}  {reason}")
+    if not out_df.empty:
+        print(bt.summarize_backtest(out_df).to_string(index=False))
+    return 0
+
+
+def cmd_ingest_books(args: argparse.Namespace) -> int:
+    markets = bk.load_markets_or_die(args.in_path)
+    paths = asyncio.run(
+        bk.ingest_books_loop(
+            markets,
+            out_dir=args.out_dir,
+            interval_seconds=args.interval,
+            duration_seconds=args.duration,
+            market_limit=args.limit,
+            concurrency=args.concurrency,
+        )
+    )
+    print(f"wrote {len(paths)} snapshot file(s) to {args.out_dir}")
+    return 0
+
+
+def cmd_analyze_books(args: argparse.Namespace) -> int:
+    try:
+        ranked = bk.analyze_books(
+            books_dir=args.books_dir,
+            out_path=args.out,
+            min_snapshots=args.min_snapshots,
+            min_spread=args.min_spread,
+        )
+    except FileNotFoundError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    print(f"wrote {len(ranked)} ranked tokens to {args.out}")
+    cols = [
+        "slug",
+        "outcome_index",
+        "n_snapshots",
+        "median_spread",
+        "mean_mid",
+        "mid_vol",
+        "geo_depth",
+        "quotable",
+        "score",
+    ]
+    cols = [c for c in cols if c in ranked.columns]
+    head = ranked[cols].head(args.top)
+    print(head.to_string(index=False))
     return 0
 
 
@@ -365,6 +524,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="cap trades per market (default: unlimited — paginates fully)",
     )
     s.set_defaults(func=cmd_ingest_trades)
+
+    s = sub.add_parser(
+        "backtest-subgraph",
+        help="cheap-side backtest against trades_subgraph.parquet (full history, not CLOB-limited)",
+    )
+    s.add_argument("--in-path", type=Path, default=DEFAULT_RAW_PATH)
+    s.add_argument("--labels", type=Path, default=DEFAULT_LABELS_PATH)
+    s.add_argument("--trades", type=Path, default=DEFAULT_TRADES_SUBGRAPH_PATH)
+    s.add_argument("--out", type=Path, default=Path("data/reports/trades_subgraph_bt.csv"))
+    s.add_argument("--delta", default="24h")
+    s.add_argument("--capital", type=float, default=1000.0)
+    s.add_argument("--max-entry-price", type=float, default=0.10)
+    s.set_defaults(func=cmd_backtest_subgraph)
+
+    s = sub.add_parser(
+        "ingest-books",
+        help="snapshot orderbooks for open markets on a schedule (MM research, Phase A)",
+    )
+    s.add_argument("--in-path", type=Path, default=DEFAULT_RAW_PATH)
+    s.add_argument("--out-dir", type=Path, default=bk.BOOKS_DIR)
+    s.add_argument("--interval", type=int, default=300, help="seconds between snapshots")
+    s.add_argument("--duration", type=int, default=3600, help="total seconds to run for")
+    s.add_argument("--limit", type=int, default=None, help="cap # markets per snapshot")
+    s.add_argument("--concurrency", type=int, default=10, help="parallel /book fetches")
+    s.set_defaults(func=cmd_ingest_books)
+
+    s = sub.add_parser(
+        "analyze-books",
+        help="rank markets by MM quotability using snapshots from ingest-books",
+    )
+    s.add_argument("--books-dir", type=Path, default=bk.BOOKS_DIR)
+    s.add_argument("--out", type=Path, default=bk.DEFAULT_BOOK_ANALYSIS_PATH)
+    s.add_argument("--min-snapshots", type=int, default=3)
+    s.add_argument(
+        "--min-spread",
+        type=float,
+        default=bk.MIN_QUOTABLE_SPREAD,
+        help="spread floor below which markets are flagged unquotable",
+    )
+    s.add_argument("--top", type=int, default=30, help="rows to print to stdout")
+    s.set_defaults(func=cmd_analyze_books)
 
     s = sub.add_parser("web", help="serve the FastAPI web UI")
     s.add_argument("--host", default="0.0.0.0")

@@ -31,10 +31,10 @@ from typing import Any
 
 import httpx
 
-# Defaults to the CTF/positions subgraph (what Polymarket originally
-# documented under that ID). Override with THEGRAPH_SUBGRAPH_ID to point
-# at the orderbook subgraph.
-DEFAULT_SUBGRAPH_ID = "Bx1W4S7kDVxs9gC3s2G6DS8kdNBJNVhMviCtin2DiBp"
+# Polymarket orderbook subgraph — has OrderFilled + NegRiskCtfExchangeOrderFilled
+# entities (makerAssetId/takerAssetId/makerAmountFilled/takerAmountFilled/
+# blockTimestamp). Override via THEGRAPH_SUBGRAPH_ID.
+DEFAULT_SUBGRAPH_ID = "EZCTgSzLPuBSqQcuR3ifeiKHKBnpjHSNbYpty8Mnjm9D"
 DEFAULT_GATEWAY = "https://gateway.thegraph.com/api"
 
 
@@ -95,53 +95,127 @@ class SubgraphClient:
             raise RuntimeError(f"subgraph query errors: {body['errors']}")
         return body.get("data", {})
 
-    async def trades_for_condition(
+    async def trades_for_token_ids(
         self,
-        condition_id: str,
+        token_ids: list[str],
         *,
         first: int | None = None,
+        include_neg_risk: bool = True,
     ) -> list[dict[str, Any]]:
-        """Return trades for a given ``conditionId``, ordered by timestamp.
+        """Return order-fill events involving any of the given CTF token IDs.
 
-        Returns a list of ``{timestamp, outcomeIndex, price, size, side}``
-        rows (exact field names depend on the subgraph schema; query
-        returns them as-indexed). Pages in batches of ``page_size`` and
-        keeps fetching until fewer rows are returned or ``first`` is hit.
+        The Polymarket orderbook subgraph (``EZCTgSz...``) indexes fills by
+        ``makerAssetId`` / ``takerAssetId`` — the on-chain ERC1155 positionId,
+        which is what CLOB calls ``token_id``. There's no ``conditionId``
+        field, so callers must resolve conditionId → [yes_token, no_token]
+        via CLOB before calling this.
+
+        We run two queries (maker side + taker side) because subgraph ``or:``
+        filter support is inconsistent across schema versions, and optionally
+        include ``negRiskCtfExchangeOrderFilleds`` for multi-outcome markets.
+
+        Each returned row carries a synthetic ``exchange`` key ("ctf" or
+        "neg_risk") so downstream code can distinguish them.
         """
-        limit = first or self.page_size
-        results: list[dict[str, Any]] = []
-        skip = 0
-        while True:
-            page_size = min(self.page_size, limit - len(results)) if first else self.page_size
-            if page_size <= 0:
-                break
-            gql = """
-            query Trades($condition: String!, $first: Int!, $skip: Int!) {
-              orderFilledEvents(
-                where: { market_: { conditionId: $condition } }
-                orderBy: timestamp
-                orderDirection: asc
-                first: $first
-                skip: $skip
-              ) {
-                id
-                timestamp
-                makerAssetId
-                takerAssetId
-                makerAmountFilled
-                takerAmountFilled
-              }
-            }
-            """
-            data = await self.query(
-                gql,
-                variables={"condition": condition_id.lower(), "first": page_size, "skip": skip},
-            )
-            batch = data.get("orderFilledEvents", []) or []
-            if not batch:
-                break
-            results.extend(batch)
-            if len(batch) < page_size:
-                break
-            skip += page_size
-        return results
+        if not token_ids:
+            return []
+        ids = [str(t) for t in token_ids]
+        limit = first
+        out: list[dict[str, Any]] = []
+
+        entities: list[str] = ["orderFilleds"]
+        if include_neg_risk:
+            entities.append("negRiskCtfExchangeOrderFilleds")
+
+        for entity in entities:
+            exchange = "neg_risk" if entity.startswith("negRisk") else "ctf"
+            for side_field in ("makerAssetId_in", "takerAssetId_in"):
+                skip = 0
+                while True:
+                    remaining = (limit - len(out)) if limit is not None else self.page_size
+                    if remaining <= 0:
+                        return out
+                    page = min(self.page_size, remaining)
+                    gql = (
+                        "query($ids: [BigInt!]!, $first: Int!, $skip: Int!) {"
+                        f"  {entity}("
+                        f"    where: {{ {side_field}: $ids }}"
+                        "    orderBy: blockTimestamp"
+                        "    orderDirection: asc"
+                        "    first: $first"
+                        "    skip: $skip"
+                        "  ) {"
+                        "    id orderHash maker taker"
+                        "    makerAssetId takerAssetId"
+                        "    makerAmountFilled takerAmountFilled"
+                        "    fee blockNumber blockTimestamp transactionHash"
+                        "  }"
+                        "}"
+                    )
+                    data = await self.query(
+                        gql,
+                        variables={"ids": ids, "first": page, "skip": skip},
+                    )
+                    batch = data.get(entity, []) or []
+                    if not batch:
+                        break
+                    for row in batch:
+                        row["exchange"] = exchange
+                        row["_match_side"] = side_field.replace("_in", "")
+                    out.extend(batch)
+                    if len(batch) < page:
+                        break
+                    skip += page
+        return out
+
+
+def derive_price_and_side(
+    row: dict[str, Any],
+    token_ids: list[str],
+) -> dict[str, Any]:
+    """Add ``timestamp_ts``, ``token_id``, ``outcome_index``, ``price``, ``size``.
+
+    On Polymarket's CTF exchange, USDC has assetId ``0`` and outcome tokens
+    have the positionId as assetId. A fill is either:
+
+      * **taker buys token** — maker pays USDC, taker pays token asset ID.
+        price = makerAmountFilled / takerAmountFilled (USDC per share).
+      * **maker sells token** — maker pays token, taker pays USDC.
+        price = takerAmountFilled / makerAmountFilled.
+
+    Both legs are 6-decimal so the ratio is already the price per share.
+    """
+    maker_id = str(row.get("makerAssetId"))
+    taker_id = str(row.get("takerAssetId"))
+    try:
+        maker_amt = int(row.get("makerAmountFilled", 0))
+        taker_amt = int(row.get("takerAmountFilled", 0))
+    except (TypeError, ValueError):
+        maker_amt = taker_amt = 0
+
+    if taker_id in token_ids:
+        token_id = taker_id
+        size = taker_amt / 1e6
+        price = (maker_amt / taker_amt) if taker_amt else None
+    elif maker_id in token_ids:
+        token_id = maker_id
+        size = maker_amt / 1e6
+        price = (taker_amt / maker_amt) if maker_amt else None
+    else:
+        token_id = None
+        size = 0.0
+        price = None
+
+    outcome_index = token_ids.index(token_id) if token_id in token_ids else None
+    try:
+        ts = int(row.get("blockTimestamp", 0))
+    except (TypeError, ValueError):
+        ts = 0
+
+    row = dict(row)
+    row["timestamp_ts"] = ts
+    row["token_id"] = token_id
+    row["outcome_index"] = outcome_index
+    row["price"] = price
+    row["size"] = size
+    return row
