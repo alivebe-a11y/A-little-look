@@ -149,7 +149,7 @@ async def _ingest_trades(
     return len(df)
 
 
-async def _inspect_subgraph() -> list[dict[str, object]]:
+async def _inspect_subgraph(subgraph_id: str | None) -> list[dict[str, object]]:
     """Introspect the top-level Query fields of the configured subgraph.
 
     Used to debug schema drift — the field names in our GraphQL queries
@@ -158,14 +158,14 @@ async def _inspect_subgraph() -> list[dict[str, object]]:
     out without guessing.
     """
     gql = "{ __schema { queryType { fields { name args { name } } } } }"
-    async with SubgraphClient() as sg:
+    async with SubgraphClient(subgraph_id=subgraph_id) as sg:
         data = await sg.query(gql)
     return data["__schema"]["queryType"]["fields"]
 
 
 def cmd_inspect_subgraph(args: argparse.Namespace) -> int:
     try:
-        fields = asyncio.run(_inspect_subgraph())
+        fields = asyncio.run(_inspect_subgraph(args.id))
     except SubgraphAuthError as e:
         print(str(e), file=sys.stderr)
         return 2
@@ -286,6 +286,11 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser(
         "inspect-subgraph",
         help="list the top-level query fields exposed by the subgraph (schema debug)",
+    )
+    s.add_argument(
+        "--id",
+        default=None,
+        help="override subgraph ID (else THEGRAPH_SUBGRAPH_ID env or built-in default)",
     )
     s.set_defaults(func=cmd_inspect_subgraph)
 
