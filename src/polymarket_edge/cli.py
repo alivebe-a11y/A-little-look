@@ -163,16 +163,62 @@ async def _inspect_subgraph(subgraph_id: str | None) -> list[dict[str, object]]:
     return data["__schema"]["queryType"]["fields"]
 
 
+async def _inspect_subgraph_type(subgraph_id: str | None, type_name: str) -> list[dict[str, object]]:
+    """Introspect the fields of a specific GraphQL type on the subgraph."""
+    gql = """
+    query($n: String!) {
+      __type(name: $n) {
+        name
+        fields {
+          name
+          type {
+            name
+            kind
+            ofType { name kind ofType { name kind } }
+          }
+        }
+      }
+    }
+    """
+    async with SubgraphClient(subgraph_id=subgraph_id) as sg:
+        data = await sg.query(gql, variables={"n": type_name})
+    t = data.get("__type")
+    return t["fields"] if t else []
+
+
+def _format_type(t: dict[str, object]) -> str:
+    """Flatten a nested GraphQL type ref into a readable string."""
+    if not t:
+        return "?"
+    kind = t.get("kind")
+    name = t.get("name")
+    of = t.get("ofType")
+    if kind == "NON_NULL":
+        return _format_type(of) + "!"
+    if kind == "LIST":
+        return "[" + _format_type(of) + "]"
+    return str(name or "?")
+
+
 def cmd_inspect_subgraph(args: argparse.Namespace) -> int:
     try:
-        fields = asyncio.run(_inspect_subgraph(args.id))
+        if args.type:
+            fields = asyncio.run(_inspect_subgraph_type(args.id, args.type))
+            if not fields:
+                print(f"type {args.type!r} not found", file=sys.stderr)
+                return 1
+            for f in fields:
+                print(f"  {f['name']}: {_format_type(f['type'])}")
+            print(f"\n{len(fields)} fields on {args.type}")
+        else:
+            fields = asyncio.run(_inspect_subgraph(args.id))
+            for f in sorted(fields, key=lambda f: f["name"]):
+                arg_names = ", ".join(a["name"] for a in f.get("args", []))
+                print(f"  {f['name']}({arg_names})")
+            print(f"\n{len(fields)} top-level query fields")
     except SubgraphAuthError as e:
         print(str(e), file=sys.stderr)
         return 2
-    for f in sorted(fields, key=lambda f: f["name"]):
-        arg_names = ", ".join(a["name"] for a in f.get("args", []))
-        print(f"  {f['name']}({arg_names})")
-    print(f"\n{len(fields)} top-level query fields")
     return 0
 
 
@@ -291,6 +337,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--id",
         default=None,
         help="override subgraph ID (else THEGRAPH_SUBGRAPH_ID env or built-in default)",
+    )
+    s.add_argument(
+        "--type",
+        default=None,
+        help="print fields of a specific GraphQL type (e.g. OrderFilled)",
     )
     s.set_defaults(func=cmd_inspect_subgraph)
 
