@@ -127,6 +127,7 @@ async def _collect_targets_live(
     limit: int | None,
     *,
     max_pages: int | None = None,
+    concurrency: int = 20,
 ) -> list[tuple[str, dict[str, Any]]]:
     """Fetch open markets from Gamma and resolve (token_id, meta) for each.
 
@@ -134,38 +135,58 @@ async def _collect_targets_live(
     parquet. Markets open and close daily — an MM research run wants the
     universe that's actually tradeable *now*, not a snapshot from last
     week. Gamma's ``closed=false`` filter is the source of truth.
+
+    CLOB ``get_market`` calls are fired concurrently (bounded by
+    ``concurrency``) because Polymarket has thousands of open markets and
+    sequential resolution takes minutes before the first snapshot can run.
     """
-    targets: list[tuple[str, dict[str, Any]]] = []
-    seen = 0
+    # Phase 1: page Gamma synchronously (a few pages, fast).
+    raw_markets: list[dict[str, Any]] = []
     async with GammaClient() as gc:
         async for raw in gc.iter_markets(closed=False, max_pages=max_pages):
-            if limit is not None and seen >= limit:
+            if limit is not None and len(raw_markets) >= limit:
                 break
             cid = raw.get("conditionId") or raw.get("condition_id")
-            if not cid:
-                continue
+            if cid:
+                raw_markets.append(raw)
+    print(f"  gamma: {len(raw_markets)} open market(s) to resolve", flush=True)
+
+    # Phase 2: resolve CLOB metadata for each, concurrently.
+    sem = asyncio.Semaphore(concurrency)
+    targets: list[tuple[str, dict[str, Any]]] = []
+    lock = asyncio.Lock()
+
+    async def _resolve(raw: dict[str, Any]) -> None:
+        cid = raw.get("conditionId") or raw.get("condition_id")
+        async with sem:
             try:
                 mkt = await clob.get_market(str(cid))
             except Exception:
+                return
+        if not mkt:
+            return
+        pairs: list[tuple[str, dict[str, Any]]] = []
+        for idx, tok in enumerate((mkt.get("tokens") or [])[:2]):
+            tid = tok.get("token_id")
+            if not tid:
                 continue
-            if not mkt:
-                continue
-            for idx, tok in enumerate((mkt.get("tokens") or [])[:2]):
-                tid = tok.get("token_id")
-                if not tid:
-                    continue
-                targets.append(
-                    (
-                        str(tid),
-                        {
-                            "market_id": str(raw.get("id", "")),
-                            "slug": str(raw.get("slug", "")),
-                            "condition_id": str(cid),
-                            "outcome_index": idx,
-                        },
-                    )
+            pairs.append(
+                (
+                    str(tid),
+                    {
+                        "market_id": str(raw.get("id", "")),
+                        "slug": str(raw.get("slug", "")),
+                        "condition_id": str(cid),
+                        "outcome_index": idx,
+                    },
                 )
-            seen += 1
+            )
+        if pairs:
+            async with lock:
+                targets.extend(pairs)
+
+    await asyncio.gather(*(_resolve(r) for r in raw_markets))
+    print(f"  clob: resolved {len(targets)} token(s) across open markets", flush=True)
     return targets
 
 
@@ -188,7 +209,10 @@ async def snapshot_once(
     rows: list[dict[str, Any]] = []
     async with ClobClient() as clob:
         if targets is None:
-            targets = await _collect_targets_live(clob, market_limit)
+            targets = await _collect_targets_live(
+                clob, market_limit, concurrency=concurrency
+            )
+        print(f"  snapshotting {len(targets)} tokens...", flush=True)
         sem = asyncio.Semaphore(concurrency)
         progress = tqdm(total=len(targets), desc="books", unit="tok", dynamic_ncols=True)
 
