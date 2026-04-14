@@ -9,7 +9,9 @@ from pathlib import Path
 import pandas as pd
 
 from . import backtest as bt
-from .clients.subgraph import SubgraphAuthError, SubgraphClient
+from .backtest import _resolve_token_ids
+from .clients.clob import ClobClient
+from .clients.subgraph import SubgraphAuthError, SubgraphClient, derive_price_and_side
 from .features import compute_features
 from .ingest import DEFAULT_RAW_PATH, ingest_markets, load_raw_markets
 from .label import DEFAULT_LABELS_PATH, label_dataframe, summarize
@@ -121,24 +123,35 @@ async def _ingest_trades(
     from tqdm.auto import tqdm
 
     progress = tqdm(total=len(target), desc="subgraph", unit="mkt", dynamic_ncols=True)
-    async with SubgraphClient() as sg:
+    token_cache: dict[str, list[str] | None] = {}
+    skipped_no_tokens = 0
+    async with ClobClient() as clob, SubgraphClient() as sg:
         for _, raw in target.iterrows():
             progress.update(1)
             mid = str(raw["id"])
             cid = raw.get("conditionId") or raw.get("condition_id")
             if not cid:
                 continue
+            token_ids = await _resolve_token_ids(clob, str(cid), token_cache)
+            if not token_ids:
+                skipped_no_tokens += 1
+                continue
             try:
-                trades = await sg.trades_for_condition(str(cid), first=per_market_limit)
+                trades = await sg.trades_for_token_ids(
+                    token_ids[:2], first=per_market_limit
+                )
             except Exception as e:
                 print(f"  {mid} {cid}: {e}", file=sys.stderr)
                 continue
             for t in trades:
-                t = dict(t)
-                t["market_id"] = mid
-                t["conditionId"] = str(cid)
-                out_rows.append(t)
+                enriched = derive_price_and_side(t, token_ids[:2])
+                enriched["market_id"] = mid
+                enriched["conditionId"] = str(cid)
+                out_rows.append(enriched)
+            progress.set_postfix(trades=len(out_rows), refresh=False)
     progress.close()
+    if skipped_no_tokens:
+        print(f"  skipped {skipped_no_tokens} markets with no CLOB tokens", file=sys.stderr)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if not out_rows:
