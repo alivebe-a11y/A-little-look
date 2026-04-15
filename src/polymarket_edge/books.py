@@ -27,6 +27,7 @@ from typing import Any
 import pandas as pd
 
 from .clients.clob import ClobClient
+from .clients.gamma import GammaClient
 from .ingest import load_raw_markets
 
 BOOKS_DIR = Path("data/raw/books")
@@ -121,35 +122,55 @@ async def _snapshot_one(
     }
 
 
-async def _collect_targets(
-    markets_df: pd.DataFrame,
+async def _collect_targets_live(
     clob: ClobClient,
     limit: int | None,
+    *,
+    max_pages: int | None = None,
+    concurrency: int = 20,
 ) -> list[tuple[str, dict[str, Any]]]:
-    """Resolve (token_id, meta) pairs for every open, known-to-CLOB market."""
-    if "closed" in markets_df.columns:
-        open_markets = markets_df[markets_df["closed"] != True]  # noqa: E712
-    else:
-        open_markets = markets_df
-    if limit is not None:
-        open_markets = open_markets.head(limit)
+    """Fetch open markets from Gamma and resolve (token_id, meta) for each.
 
+    We pull fresh from Gamma every time rather than reusing an on-disk
+    parquet. Markets open and close daily — an MM research run wants the
+    universe that's actually tradeable *now*, not a snapshot from last
+    week. Gamma's ``closed=false`` filter is the source of truth.
+
+    CLOB ``get_market`` calls are fired concurrently (bounded by
+    ``concurrency``) because Polymarket has thousands of open markets and
+    sequential resolution takes minutes before the first snapshot can run.
+    """
+    # Phase 1: page Gamma synchronously (a few pages, fast).
+    raw_markets: list[dict[str, Any]] = []
+    async with GammaClient() as gc:
+        async for raw in gc.iter_markets(closed=False, max_pages=max_pages):
+            if limit is not None and len(raw_markets) >= limit:
+                break
+            cid = raw.get("conditionId") or raw.get("condition_id")
+            if cid:
+                raw_markets.append(raw)
+    print(f"  gamma: {len(raw_markets)} open market(s) to resolve", flush=True)
+
+    # Phase 2: resolve CLOB metadata for each, concurrently.
+    sem = asyncio.Semaphore(concurrency)
     targets: list[tuple[str, dict[str, Any]]] = []
-    for _, raw in open_markets.iterrows():
+    lock = asyncio.Lock()
+
+    async def _resolve(raw: dict[str, Any]) -> None:
         cid = raw.get("conditionId") or raw.get("condition_id")
-        if not cid:
-            continue
-        try:
-            mkt = await clob.get_market(str(cid))
-        except Exception:
-            continue
+        async with sem:
+            try:
+                mkt = await clob.get_market(str(cid))
+            except Exception:
+                return
         if not mkt:
-            continue
+            return
+        pairs: list[tuple[str, dict[str, Any]]] = []
         for idx, tok in enumerate((mkt.get("tokens") or [])[:2]):
             tid = tok.get("token_id")
             if not tid:
                 continue
-            targets.append(
+            pairs.append(
                 (
                     str(tid),
                     {
@@ -160,26 +181,38 @@ async def _collect_targets(
                     },
                 )
             )
+        if pairs:
+            async with lock:
+                targets.extend(pairs)
+
+    await asyncio.gather(*(_resolve(r) for r in raw_markets))
+    print(f"  clob: resolved {len(targets)} token(s) across open markets", flush=True)
     return targets
 
 
 async def snapshot_once(
-    markets_df: pd.DataFrame,
     out_dir: Path = BOOKS_DIR,
     *,
     market_limit: int | None = None,
     concurrency: int = 10,
-) -> Path | None:
+    targets: list[tuple[str, dict[str, Any]]] | None = None,
+) -> tuple[Path | None, list[tuple[str, dict[str, Any]]]]:
     """Grab one orderbook snapshot across all open markets and write a parquet.
 
-    Returns the file path, or None if nothing was snapshotted.
+    If ``targets`` is provided, reuse it (avoids re-resolving tokens on
+    every loop iteration). Returns (path_or_none, targets_used) so the
+    caller can cache targets across successive snapshots.
     """
     from tqdm.auto import tqdm
 
     out_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
     async with ClobClient() as clob:
-        targets = await _collect_targets(markets_df, clob, market_limit)
+        if targets is None:
+            targets = await _collect_targets_live(
+                clob, market_limit, concurrency=concurrency
+            )
+        print(f"  snapshotting {len(targets)} tokens...", flush=True)
         sem = asyncio.Semaphore(concurrency)
         progress = tqdm(total=len(targets), desc="books", unit="tok", dynamic_ncols=True)
 
@@ -194,34 +227,47 @@ async def snapshot_once(
         progress.close()
 
     if not rows:
-        return None
+        return None, targets
     df = pd.DataFrame(rows)
     ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d-%H%M%S")
     out_path = out_dir / f"books-{ts}.parquet"
     df.to_parquet(out_path, index=False)
-    return out_path
+    return out_path, targets
 
 
 async def ingest_books_loop(
-    markets_df: pd.DataFrame,
     out_dir: Path = BOOKS_DIR,
     *,
     interval_seconds: int = 300,
     duration_seconds: int,
     market_limit: int | None = None,
     concurrency: int = 10,
+    refresh_targets_every: int = 12,
 ) -> list[Path]:
-    """Repeatedly snapshot books until ``duration_seconds`` elapses."""
+    """Repeatedly snapshot books until ``duration_seconds`` elapses.
+
+    Re-resolves the open-markets universe every ``refresh_targets_every``
+    iterations (default: every 12 iterations = 1h at 5-min cadence) so
+    newly-created markets get picked up and resolved ones drop out.
+    """
     start = time.time()
     written: list[Path] = []
+    targets: list[tuple[str, dict[str, Any]]] | None = None
+    iteration = 0
     while True:
         loop_started = time.time()
-        path = await snapshot_once(
-            markets_df, out_dir, market_limit=market_limit, concurrency=concurrency
+        if iteration % refresh_targets_every == 0:
+            targets = None  # force re-resolution from Gamma
+        path, targets = await snapshot_once(
+            out_dir,
+            market_limit=market_limit,
+            concurrency=concurrency,
+            targets=targets,
         )
         if path is not None:
             written.append(path)
             print(f"  snapshot -> {path} ({path.stat().st_size} bytes)")
+        iteration += 1
         if time.time() - start + interval_seconds >= duration_seconds:
             break
         elapsed = time.time() - loop_started
@@ -266,8 +312,20 @@ def analyze_books(
     per_token = per_token[per_token["n_snapshots"] >= min_snapshots]
     per_token["mid_vol"] = per_token["mid_vol"].fillna(0.0)
     # Geometric mean of the two sides' depth — punishes one-sided books.
-    per_token["geo_depth"] = (per_token["median_bid_depth"].clip(lower=1) * per_token["median_ask_depth"].clip(lower=1)) ** 0.5
-    per_token["quotable"] = per_token["median_spread"] >= min_spread
+    # Use raw product (no .clip(lower=1)) so zero depth on either side
+    # zeroes the score. Previously a 0-depth book got geo_depth=1, and
+    # "empty" tokens with 1¢ / 99¢ dust orders dominated the ranking with
+    # fake 97¢ spreads.
+    per_token["geo_depth"] = (
+        per_token["median_bid_depth"] * per_token["median_ask_depth"]
+    ).clip(lower=0) ** 0.5
+    # Quotable requires real two-sided depth AND a spread that clears the
+    # fee/gas floor. Either alone is useless for MM.
+    per_token["quotable"] = (
+        (per_token["median_spread"] >= min_spread)
+        & (per_token["median_bid_depth"] > 0)
+        & (per_token["median_ask_depth"] > 0)
+    )
     per_token["score"] = (
         per_token["median_spread"] * per_token["geo_depth"] / (1.0 + per_token["mid_vol"])
     ).where(per_token["quotable"], 0.0)
