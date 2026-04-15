@@ -312,8 +312,20 @@ def analyze_books(
     per_token = per_token[per_token["n_snapshots"] >= min_snapshots]
     per_token["mid_vol"] = per_token["mid_vol"].fillna(0.0)
     # Geometric mean of the two sides' depth — punishes one-sided books.
-    per_token["geo_depth"] = (per_token["median_bid_depth"].clip(lower=1) * per_token["median_ask_depth"].clip(lower=1)) ** 0.5
-    per_token["quotable"] = per_token["median_spread"] >= min_spread
+    # Use raw product (no .clip(lower=1)) so zero depth on either side
+    # zeroes the score. Previously a 0-depth book got geo_depth=1, and
+    # "empty" tokens with 1¢ / 99¢ dust orders dominated the ranking with
+    # fake 97¢ spreads.
+    per_token["geo_depth"] = (
+        per_token["median_bid_depth"] * per_token["median_ask_depth"]
+    ).clip(lower=0) ** 0.5
+    # Quotable requires real two-sided depth AND a spread that clears the
+    # fee/gas floor. Either alone is useless for MM.
+    per_token["quotable"] = (
+        (per_token["median_spread"] >= min_spread)
+        & (per_token["median_bid_depth"] > 0)
+        & (per_token["median_ask_depth"] > 0)
+    )
     per_token["score"] = (
         per_token["median_spread"] * per_token["geo_depth"] / (1.0 + per_token["mid_vol"])
     ).where(per_token["quotable"], 0.0)
